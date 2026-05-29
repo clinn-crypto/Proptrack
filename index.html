@@ -260,7 +260,7 @@ tbody tr:hover td { background: var(--bg); }
       </div>
       <div>
         <div class="logo-text">PropTrack</div>
-        <div class="logo-sub">v1.0 · Rental Manager</div>
+        <div class="logo-sub">v2.0 · Cloud Edition</div>
       </div>
     </div>
   </div>
@@ -1363,7 +1363,6 @@ async function _dbLoadAll() {
       const {data, error} = await supa.from(t).select('data');
       if(error) throw error;
       let rows = (data||[]).map(r=>r.data);
-      // Restore file data from localStorage for docs
       if(t === 'docs') rows = _restoreFilesFromLocal(rows);
       DB._store[t] = rows;
     } catch(e) {
@@ -1372,6 +1371,38 @@ async function _dbLoadAll() {
     }
   }));
   DB._store['seeded'] = ['yes'];
+
+  // Auto-fix: deduplicate within each table by ID, and fix cross-contamination
+  const exps = DB._store['expenses'] || [];
+  const caps = DB._store['capital']  || [];
+  const capitalIds = new Set(caps.map(c=>c.id));
+  const expIds     = new Set(exps.map(e=>e.id));
+
+  // Deduplicate within expenses by ID
+  const seenExp = new Set();
+  const cleanExps = exps.filter(e => {
+    if(seenExp.has(e.id)) return false;
+    seenExp.add(e.id);
+    return e.etype !== 'capital' && !capitalIds.has(e.id);
+  });
+
+  // Deduplicate within capital by ID
+  const seenCap = new Set();
+  const cleanCaps = caps.filter(c => {
+    if(seenCap.has(c.id)) return false;
+    seenCap.add(c.id);
+    return c.etype !== 'operating' && !expIds.has(c.id);
+  });
+
+  if(cleanExps.length !== exps.length){
+    DB._store['expenses'] = cleanExps;
+    await _dbWrite('expenses', cleanExps);
+  }
+  if(cleanCaps.length !== caps.length){
+    DB._store['capital'] = cleanCaps;
+    await _dbWrite('capital', cleanCaps);
+  }
+
   showSyncStatus('✓ Connected to cloud database');
 }
 
@@ -1625,8 +1656,13 @@ async function confirmImport(){
   try {
     // Write each table sequentially and wait for completion
     for(const k of KEYS){
-      const arr = _pendingImportData[k];
+      let arr = _pendingImportData[k];
       if(!arr || !arr.length) continue;
+
+      // Fix: ensure expenses only contains operating, capital only contains capital
+      if(k === 'expenses') arr = arr.filter(e => e.etype !== 'capital');
+      if(k === 'capital')  arr = arr.filter(c => c.etype !== 'operating');
+
       showSyncStatus('⟳ Importing ' + k + '...', 'var(--amber)');
 
       // For docs: save file data to localStorage first, strip from DB rows
@@ -2909,8 +2945,13 @@ function saveExpense(){
   const notes  = document.getElementById('em-notes').value;
   if(!unit||!amount){ toast('Unit and amount required'); return; }
   const entry = { id:uid(), date, unit, cat, vendor, amount, ded, notes, etype };
+  // Ensure the entry only goes to the correct table
   if(etype==='capital'){
-    const caps = DB.get('capital'); caps.unshift(entry); DB.set('capital', caps);
+    entry.etype = 'capital';
+    const caps = DB.get('capital');
+    // Make sure it's not in expenses
+    DB.set('expenses', DB.get('expenses').filter(e=>e.id!==entry.id));
+    caps.unshift(entry); DB.set('capital', caps);
     // Add to unit's adjusted cost basis
     const units = DB.get('units');
     const u = units.find(x=>x.id===unit);
@@ -3864,6 +3905,10 @@ async function initApp() {
   }
   buildUnitTree();
   renderDashboard();
+  // Re-render current page if not dashboard to pick up any auto-fixes
+  if(currentPage && currentPage !== 'dashboard'){
+    render(currentPage);
+  }
 }
 
 initApp();
